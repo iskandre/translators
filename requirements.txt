@@ -3,3 +3,5 @@ PyExecJS
 lxml
 pathos
 cryptography
+aiohttp
+asyncio
