@@ -58,6 +58,9 @@ import cryptography.hazmat.primitives.hashes as cry_hashes
 import cryptography.hazmat.primitives.asymmetric.padding as cry_padding
 import cryptography.hazmat.primitives.serialization as cry_serialization
 
+import aiohttp
+import asyncio
+
 
 __all__ = [
     'translate_text', 'translate_html', 'translators_pool',
@@ -524,6 +527,125 @@ class GoogleV2(Tse):
         time.sleep(sleep_seconds)
         self.query_count += 1
         return {'data': data} if is_detail_result else ' '.join([x[0] for x in (data[1][0][0][5] or data[1][0]) if x[0]])
+
+class AsyncGoogleV2(Tse):
+    def __init__(self, server_region='EN'):
+        super().__init__()
+        self.host_url = None
+        self.cn_host_url = 'https://translate.google.cn'
+        self.en_host_url = 'https://translate.google.com'
+        self.api_url = None
+        self.api_url_path = '/_/TranslateWebserverUi/data/batchexecute'
+        self.server_region = server_region
+        self.host_headers = None
+        self.api_headers = None
+        self.language_map = None
+        self.session = None
+        self.rpcid = 'MkEWBc'
+        self.query_count = 0
+        self.output_zh = 'zh-CN'
+        self.input_limit = 5000
+
+    @Tse.debug_language_map
+    def get_language_map(self, host_html, **kwargs):
+        parser = lxml.etree.HTMLParser(huge_tree=False)
+        et = lxml.etree.fromstring((host_html), parser)
+        lang_list = sorted(list(set(et.xpath('//*/@data-language-code'))))
+        return {}.fromkeys(lang_list, lang_list)
+
+    def get_rpc(self, query_text, from_language, to_language):
+        param = json.dumps([[query_text, from_language, to_language, True], [1]])
+        rpc = json.dumps([[[self.rpcid, param, None, "generic"]]])
+        return {'f.req': rpc}
+
+    def get_info(self, host_html):
+        data_str = re.compile(r'window.WIZ_global_data = (.*?);</script>').findall(host_html)[0]
+        data = execjs.eval(data_str)
+        return {'bl': data['cfb2h'], 'f.sid': data['FdrFJe']}
+
+    def get_consent_cookie(self, consent_html):  # by mercuree. merged but not verify.
+        parser = lxml.etree.HTMLParser(huge_tree=False)
+        et = lxml.etree.fromstring((consent_html), parser)
+        input_element = et.xpath('.//input[@type="hidden"][@name="v"]')
+        cookie_value = input_element[0].attrib.get('value') if input_element else 'cb'
+        return f'CONSENT=YES+{cookie_value}'  # cookie CONSENT=YES+cb works for now
+
+    @Tse.time_stat
+    @Tse.check_query
+    async def google_api(self, query_text: str, from_language: str = 'auto', to_language: str = 'en', **kwargs):
+        """
+        https://translate.google.com, https://translate.google.cn.
+        :param query_text: str, must.
+        :param from_language: str, default 'auto'.
+        :param to_language: str, default 'en'.
+        :param **kwargs:
+                :param timeout: float, default None.
+                :param proxies: dict, default None.
+                :param sleep_seconds: float, default `random.random()`.
+                :param is_detail_result: boolean, default False.
+                :param if_ignore_limit_of_length: boolean, default False.
+                :param limit_of_length: int, default 5000.
+                :param if_ignore_empty_query: boolean, default False.
+                :param update_session_after_seconds: float, default 1500.
+                :param if_show_time_stat: boolean, default False.
+                :param show_time_stat_precision: int, default 4.
+                :param if_use_cn_host: boolean, default None.
+                :param reset_host_url: str, default None.
+        :return: str or dict
+        """
+
+        timeout = kwargs.get('timeout', None)
+        proxies = kwargs.get('proxies', None)
+        is_detail_result = kwargs.get('is_detail_result', False)
+        # CHANGED HERE: 0 instead of random.random()
+        sleep_seconds = kwargs.get('sleep_seconds', 0)
+        update_session_after_seconds = kwargs.get('update_session_after_seconds', self.default_session_seconds)
+
+        reset_host_url = kwargs.get('reset_host_url', None)
+        if reset_host_url and reset_host_url != self.host_url:
+            if not reset_host_url[:25] == 'https://translate.google.':
+                raise TranslatorError
+            self.host_url = reset_host_url
+        else:
+            use_cn_condition = kwargs.get('if_use_cn_host', None) or self.server_region == 'CN'
+            self.host_url = self.cn_host_url if use_cn_condition else self.en_host_url
+
+        if self.host_url[-2:] == 'cn':
+            raise TranslatorError('Google service was offline in China Mainland on Oct 2022.')
+
+
+        self.api_url = f'{self.host_url}{self.api_url_path}'
+        self.host_headers = self.host_headers or self.get_headers(self.host_url, if_api=False)  # reuse cookie header
+        self.api_headers = self.get_headers(self.host_url, if_api=True, if_referer_for_host=True, if_ajax_for_api=True)
+
+        not_update_cond_time = 1 if time.time() - self.begin_time < update_session_after_seconds else 0
+        if not (self.session and not_update_cond_time and self.language_map):
+            self.session = aiohttp.ClientSession()
+            async with self.session.get(self.host_url, headers=self.host_headers, timeout=timeout, proxy=proxies) as resp:
+                resp_text = await resp.read()
+                if resp.url.host.startswith('consent.google.'):
+                    consent_cookies = self.get_consent_cookie(resp_text)
+                    self.host_headers.update({'cookie': consent_cookies})
+                    self.session.cookie_jar.clear()
+                    async with self.session.get(self.host_url, headers=self.host_headers, timeout=timeout, proxy=proxies) as resp_consent:
+                        host_html = await resp_consent.read()
+                else:
+                    # print('not consent')
+                    host_html = resp_text
+                    self.session = session
+                self.language_map = self.get_language_map(host_html, from_language=from_language, to_language=to_language)
+
+        from_language, to_language = self.check_language(from_language, to_language, self.language_map, output_zh=self.output_zh)
+        rpc_data = self.get_rpc(query_text, from_language, to_language)
+        rpc_data = urllib.parse.urlencode(rpc_data)
+
+        async with self.session.post(self.api_url, headers=self.api_headers, data=rpc_data, timeout=timeout, proxy=proxies) as resp_translate:
+            res = await resp_translate.read()
+            json_data = json.loads(res.decode()[6:])
+            data = json.loads(json_data[0][2])
+            time.sleep(sleep_seconds)
+            self.query_count += 1
+            return {'data': data} if is_detail_result else ' '.join([x[0] for x in (data[1][0][0][5] or data[1][0]) if x[0]])
 
 
 class BaiduV1(Tse):
@@ -2960,6 +3082,8 @@ class TranslatorsServer:
         self.yandex = self._yandex.yandex_api
         self._youdao = YoudaoV3()
         self.youdao = self._youdao.youdao_api
+        self._async_google = AsyncGoogleV2(server_region=self.server_region)
+        self.async_google = self._async_google.google_api
         self.translators_dict = {
             'alibaba': self.alibaba, 'argos': self.argos, 'baidu': self.baidu, 'bing':self.bing,
             'caiyun': self.caiyun, 'deepl': self.deepl, 'google': self.google, 'iciba': self.iciba,
@@ -2968,7 +3092,14 @@ class TranslatorsServer:
             'sogou': self.sogou, 'tencent': self.tencent, 'translateCom': self.translateCom, 'utibet': self.utibet,
             'yandex': self.yandex, 'youdao': self.youdao,
         }
-        self.translators_pool = list(self.translators_dict.keys())
+        self.translators_dict_async = {
+            'google':self.async_google
+        }
+        self.translators_pool = list(self.translators_dict.keys()) + list(self.translators_dict_async.keys())
+
+    async def coro_translate(self, translator, query_text, from_language, to_language, **kwargs):
+        res = await self.translators_dict_async[translator](query_text, from_language, to_language, **kwargs)
+        return res
 
     def translate_text(self,
                        query_text: str,
@@ -2999,9 +3130,16 @@ class TranslatorsServer:
                 :param lingvanex_model: str, default 'B2C'.
         :return: str or dict
         """
-
+        print('translating')
         if translator not in self.translators_pool:
             raise TranslatorError
+
+        if kwargs.get('is_async') and type(kwargs.get('is_async')) == bool:
+            event_loop = asyncio.get_event_loop()
+            res = event_loop.run_until_complete(self.coro_translate(translator,query_text,from_language,to_language, **kwargs))
+            print(res)
+            return res
+            
         return self.translators_dict[translator](query_text=query_text, from_language=from_language, to_language=to_language, **kwargs)
 
     def translate_html(self,
