@@ -60,6 +60,8 @@ setup(
         'lxml>=4.9.1',
         'pathos>=0.2.9',
         'cryptography>=38.0.1',
+        'asyncio>=3.4.1',
+        'aiohttp>=3.6.0'
     ],
     python_requires='>=3.6',
     extras_require={'pypi': ['build>=0.8.0', 'twine>=4.0.1']},
