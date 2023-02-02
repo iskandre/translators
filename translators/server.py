@@ -2,29 +2,22 @@
 # author=UlionTse
 
 """MIT License
-
 Copyright (c) 2017-2022 UlionTse
-
 Warning: Prohibition of commercial use!
 This module is designed to help students and individuals with translation services.
 For commercial use, please purchase API services from translation suppliers.
-
 Don't make high frequency requests!
 Enterprises provide free services, we should be grateful instead of making trouble.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
-
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software. You may obtain a copy of the
 License at
-
     https://github.com/uliontse/translators/blob/master/LICENSE
-
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -569,6 +562,17 @@ class AsyncGoogleV2(Tse):
         input_element = et.xpath('.//input[@type="hidden"][@name="v"]')
         cookie_value = input_element[0].attrib.get('value') if input_element else 'cb'
         return f'CONSENT=YES+{cookie_value}'  # cookie CONSENT=YES+cb works for now
+
+    async def coro_translate(self, query_text, from_language, to_language, **kwargs):
+        res = await self.google_api(query_text, from_language, to_language, **kwargs)
+        return res
+
+    @Tse.time_stat
+    @Tse.check_query
+    def async_google(self, query_text: str, from_language: str = 'auto', to_language: str = 'en', **kwargs):
+        event_loop = asyncio.get_event_loop()
+        res = event_loop.run_until_complete(self.coro_translate(query_text,from_language,to_language, **kwargs))
+        return res
 
     @Tse.time_stat
     @Tse.check_query
@@ -1766,6 +1770,147 @@ class Caiyun(Tse):
         self.query_count += 1
         return data if is_detail_result else '\n'.join([self.decrypt(item) for item in data['target']])
 
+'''
+class AsyncDeepl(Tse):
+    def __init__(self):
+        super().__init__()
+        self.host_url = 'https://www.deepl.com/translator'
+        self.api_url = 'https://www2.deepl.com/jsonrpc'
+        self.host_headers = self.get_headers(self.host_url, if_api=False)
+        self.api_headers = self.get_headers(self.host_url, if_api=True, if_ajax_for_api=False, if_json_for_api=True)
+        self.params = {'split': {'method': 'LMT_split_text'}, 'handle': {'method': 'LMT_handle_jobs'}}
+        self.request_id = random.randrange(100, 10000) * 10000 + 4
+        self.language_map = None
+        self.session = None
+        self.query_count = 0
+        self.output_zh = 'zh'
+        self.input_limit = 5000
+
+    @Tse.debug_language_map
+    def get_language_map(self, host_html, **kwargs):
+        lang_list = list(set(re.compile('translateIntoLang\.(\w+)":').findall(host_html)))
+        return {}.fromkeys(lang_list, lang_list)
+
+    def split_sentences_param(self, query_text, from_language):
+        data = {
+            'id': self.request_id,
+            'jsonrpc': '2.0',
+            'params': {
+                'texts': query_text.split('\n'),
+                'commonJobParams': {'mode': 'translate'},
+                'lang': {
+                    'lang_user_selected': from_language,
+                    'preference': {
+                        'weight': {},
+                        'default': 'default',
+                    },
+                },
+            },
+        }
+        return {**self.params['split'], **data}
+
+    def context_sentences_param(self, sentences, from_language, to_language):
+        sentences = [''] + sentences + ['']
+        data = {
+            'id': self.request_id + 1,
+            'jsonrpc': ' 2.0',
+            'params': {
+                'priority': 1,  # -1 if 'quality': 'fast'
+                'timestamp': int(time.time() * 1000),
+                'commonJobParams': {
+                    # 'regionalVariant': 'en-US',
+                    'browserType': 1,
+                    'mode': 'translate',
+                },
+                'jobs': [
+                    {
+                        'kind': 'default',
+                        # 'quality': 'fast', # -1
+                        'sentences': [{'id': i-1, 'prefix': '', 'text': sentences[i]}],
+                        'raw_en_context_before': sentences[1:i] if sentences[i-1] else [],
+                        'raw_en_context_after': [sentences[i+1]] if sentences[i+1] else [],
+                        'preferred_num_beams': 1 if len(sentences) >= 4 else 4,  # 1 if two sentences else 4, len>=2+2
+                    } for i in range(1, len(sentences) - 1)
+                ],
+                'lang': {
+                    'preference': {
+                        'weight': {},
+                        'default': 'default',
+                    },
+                    'source_lang_user_selected': from_language,  # "source_lang_computed"
+                    'target_lang': to_language,
+                },
+            },
+        }
+        return {**self.params['handle'], **data}
+
+    @Tse.time_stat
+    @Tse.check_query
+    def deepl_api(self, query_text: str, from_language: str = 'auto', to_language: str = 'en', **kwargs) -> Union[str, dict]:
+        """
+        https://www.deepl.com
+        :param query_text: str, must.
+        :param from_language: str, default 'auto'.
+        :param to_language: str, default 'en'.
+        :param **kwargs:
+                :param timeout: float, default None.
+                :param proxies: dict, default None.
+                :param sleep_seconds: float, default `random.random()`.
+                :param is_detail_result: boolean, default False.
+                :param if_ignore_limit_of_length: boolean, default False.
+                :param limit_of_length: int, default 5000.
+                :param if_ignore_empty_query: boolean, default False.
+                :param update_session_after_seconds: float, default 1500.
+                :param if_show_time_stat: boolean, default False.
+                :param show_time_stat_precision: int, default 4.
+        :return: str or dict
+        """
+        timeout = kwargs.get('timeout', None)
+        proxies = kwargs.get('proxies', None)
+        is_detail_result = kwargs.get('is_detail_result', False)
+        sleep_seconds = kwargs.get('sleep_seconds', random.random())
+        update_session_after_seconds = kwargs.get('update_session_after_seconds', self.default_session_seconds)
+
+        not_update_cond_time = 1 if time.time() - self.begin_time < update_session_after_seconds else 0
+        if not (self.session and not_update_cond_time and self.language_map):
+            self.session = aiohttp.ClientSession()
+            async with self.session.get(self.host_url, headers=self.host_headers, timeout=timeout, proxy=proxies) as resp:
+                host_html = await resp.read()
+
+                self.language_map = self.get_language_map(host_html, from_language=from_language, to_language=to_language)
+
+        if not self.language_map:
+            return 
+
+        from_language, to_language = self.check_language(from_language, to_language, language_map=self.language_map, output_zh=self.output_zh, output_auto='auto')
+        from_language = from_language.upper() if from_language != 'auto' else from_language
+        to_language = to_language.upper() if to_language != 'auto' else to_language
+
+        ssp_data = self.split_sentences_param(query_text, from_language)
+
+        s_data = {}
+        async with self.session.post(self.api_url, params=self.params['split'], json=ssp_data, headers=self.api_headers, timeout=timeout, proxy=proxies) as resp:
+            res = await resp.read()
+            s_data = json.loads(res.decode()[6:])
+
+        if len(s_data) == 0:
+            return 
+        s_sentences = [it['sentences'][0]['text'] for item in s_data['result']['texts'] for it in item['chunks']]
+        h_data = self.context_sentences_param(s_sentences, from_language, to_language)
+
+        data = {}
+        async with self.session.post(self.api_url, params=self.params['handle'], json=h_data, headers=self.api_headers, timeout=timeout, proxy=proxies) as resp:
+            res = await resp.read()
+            data = json.loads(res.decode())
+
+        if len(data) == 0:
+            return
+
+        time.sleep(sleep_seconds)
+        self.request_id += 3
+        self.query_count += 1
+        return data if is_detail_result else '\n'.join(item['beams'][0]['sentences'][0]["text"] for item in data['result']['translations'])
+'''
 
 class Deepl(Tse):
     def __init__(self):
@@ -3083,7 +3228,8 @@ class TranslatorsServer:
         self._youdao = YoudaoV3()
         self.youdao = self._youdao.youdao_api
         self._async_google = AsyncGoogleV2(server_region=self.server_region)
-        self.async_google = self._async_google.google_api
+        self.async_google_coro = self._async_google.google_api
+        self.async_google = self._async_google.async_google
         self.translators_dict = {
             'alibaba': self.alibaba, 'argos': self.argos, 'baidu': self.baidu, 'bing':self.bing,
             'caiyun': self.caiyun, 'deepl': self.deepl, 'google': self.google, 'iciba': self.iciba,
@@ -3093,12 +3239,12 @@ class TranslatorsServer:
             'yandex': self.yandex, 'youdao': self.youdao,
         }
         self.translators_dict_async = {
-            'google':self.async_google
+            'async_google':self.async_google_coro
         }
         self.translators_pool = list(self.translators_dict.keys()) + list(self.translators_dict_async.keys())
 
     async def coro_translate(self, translator, query_text, from_language, to_language, **kwargs):
-        res = await self.translators_dict_async[translator](query_text, from_language, to_language, **kwargs)
+        res = await self.translators_dict_async['async_%s'%translator](query_text, from_language, to_language, **kwargs)
         return res
 
     def translate_text(self,
@@ -3135,10 +3281,12 @@ class TranslatorsServer:
             raise TranslatorError
 
         if kwargs.get('is_async') and type(kwargs.get('is_async')) == bool:
-            event_loop = asyncio.get_event_loop()
-            res = event_loop.run_until_complete(self.coro_translate(translator,query_text,from_language,to_language, **kwargs))
-            print(res)
-            return res
+            if self.translators_dict_async.get('async_%s'%translator):
+                print('async')
+                event_loop = asyncio.get_event_loop()
+                res = event_loop.run_until_complete(self.coro_translate(translator,query_text,from_language,to_language, **kwargs))
+                print(res)
+                return res
             
         return self.translators_dict[translator](query_text=query_text, from_language=from_language, to_language=to_language, **kwargs)
 
@@ -3240,6 +3388,9 @@ _yandex = tss._yandex
 yandex = tss.yandex
 _youdao = tss._youdao
 youdao = tss.youdao
+_async_google = tss._async_google
+async_google = tss.async_google
+
 
 translate_text = tss.translate_text
 translate_html = tss.translate_html
