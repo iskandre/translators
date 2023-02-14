@@ -3181,6 +3181,137 @@ class Mglip(Tse):
         self.query_count += 1
         return data if is_detail_result else data['datas'][0]['paragraph'] if data['datas'][0]['type'] == 'trans' else data['datas'][0]['data']
 
+class AsyncPapago(Tse):
+    def __init__(self):
+        super().__init__()
+        self.host_url = 'https://papago.naver.com'
+        self.api_url = 'https://papago.naver.com/apis/n2mt/translate'  # nsmt
+        self.web_api_url = 'https://papago.naver.net/website'
+        self.lang_detect_url = 'https://papago.naver.com/apis/langs/dect'
+        self.language_url = None
+        self.language_url_pattern = '/home.(.*?).chunk.js'
+        self.host_headers = self.get_headers(self.host_url, if_api=False)
+        self.api_headers = self.get_headers(self.host_url, if_api=True, if_json_for_api=False)
+        self.language_map = None
+        self.session = None
+        self.device_id = uuid.uuid4().__str__()
+        self.auth_key = None  # 'v1.7.1_12f919c9b5'  #'v1.6.7_cc60b67557'
+        self.query_count = 0
+        self.output_zh = 'zh-CN'
+        self.input_limit = 5000
+
+    @Tse.debug_language_map
+    def get_language_map(self, lang_html, **kwargs):
+        lang_str = re.compile('={ALL:(.*?)}').search(lang_html).group()[1:]
+        lang_str = lang_str.lower().replace('zh-cn', 'zh-CN').replace('zh-tw', 'zh-TW')
+        lang_list = re.compile(',"(.*?)":|,(.*?):').findall(lang_str)
+        lang_list = [j if j else k for j, k in lang_list]
+        lang_list = sorted(list(filter(lambda x: x not in ('all', 'auto'), lang_list)))
+        return {}.fromkeys(lang_list, lang_list)
+
+    def get_auth_key(self, lang_html):
+        return re.compile('AUTH_KEY:"(.*?)"').findall(lang_html)[0]
+
+    def get_authorization(self, url, auth_key, device_id, time_stamp):
+        '''Authorization: "PPG " + t + ":" + p.a.HmacMD5(t + "\n" + e.split("?")[0] + "\n" + n, "v1.6.7_cc60b67557").toString(p.a.enc.Base64)'''
+        auth = hmac.new(key=auth_key.encode(), msg=f'{device_id}\n{url}\n{time_stamp}'.encode(), digestmod='md5').digest()
+        return f'PPG {device_id}:{base64.b64encode(auth).decode()}'
+
+    async def coro_translate(self, query_text, from_language, to_language, **kwargs):
+        res = await self.papago_api(query_text, from_language, to_language, **kwargs)
+        return res
+
+    @Tse.time_stat
+    @Tse.check_query
+    def async_papago(self, query_text: str, from_language: str = 'auto', to_language: str = 'en', **kwargs):
+        event_loop = asyncio.get_event_loop()
+        res = event_loop.run_until_complete(self.coro_translate(query_text,from_language,to_language, **kwargs))
+        return res
+
+    @Tse.time_stat
+    @Tse.check_query
+    async def papago_api(self, query_text: str, from_language: str = 'auto', to_language: str = 'en', **kwargs) -> Union[str, dict]:
+        """
+        https://papago.naver.com
+        :param query_text: str, must.
+        :param from_language: str, default 'auto'.
+        :param to_language: str, default 'zh'.
+        :param **kwargs:
+                :param timeout: float, default None.
+                :param proxies: dict, default None.
+                :param sleep_seconds: float, default `random.random()`.
+                :param is_detail_result: boolean, default False.
+                :param if_ignore_limit_of_length: boolean, default False.
+                :param limit_of_length: int, default 5000.
+                :param if_ignore_empty_query: boolean, default False.
+                :param update_session_after_seconds: float, default 1500.
+                :param if_show_time_stat: boolean, default False.
+                :param show_time_stat_precision: int, default 4.
+        :return: str or dict
+        """
+        timeout = kwargs.get('timeout', None)
+        proxies = kwargs.get('proxies', None)
+        is_detail_result = kwargs.get('is_detail_result', False)
+        sleep_seconds = kwargs.get('sleep_seconds', random.random())
+        update_session_after_seconds = kwargs.get('update_session_after_seconds', self.default_session_seconds)
+
+        async def on_request_start(session, trace_config_ctx, params):
+            trace_config_ctx.start = asyncio.get_event_loop().time()
+
+        async def on_acquire_connection(session, trace_config_ctx, params):
+            elapsed = asyncio.get_event_loop().time() - trace_config_ctx.start
+
+        async def on_request_end(session, trace_config_ctx, params):
+            elapsed = asyncio.get_event_loop().time() - trace_config_ctx.start
+
+        trace_config = aiohttp.TraceConfig()
+        trace_config.on_request_start.append(on_request_start)
+        trace_config.on_connection_create_end.append(on_acquire_connection)
+        trace_config.on_request_end.append(on_request_end)
+
+        not_update_cond_time = 1 if time.time() - self.begin_time < update_session_after_seconds else 0
+        if not (self.session and not_update_cond_time and self.language_map and self.auth_key):
+            self.session = aiohttp.ClientSession(trace_configs=[trace_config])
+            async with self.session.get(self.host_url, headers=self.host_headers, timeout=timeout, proxy=proxies) as resp:
+                host_html = await resp.read()
+                url_path = re.compile(self.language_url_pattern).search(host_html.decode()).group()
+                self.language_url = ''.join([self.host_url, url_path])
+                async with self.session.get(self.language_url, headers=self.host_headers, timeout=timeout, proxy=proxies) as resp:
+                    lang_html = await resp.read()
+                    self.language_map = self.get_language_map(lang_html.decode(), from_language=from_language, to_language=to_language)
+                    self.auth_key = self.get_auth_key(lang_html.decode())
+
+        from_language, to_language = self.check_language(from_language, to_language, self.language_map, output_zh=self.output_zh)
+
+        detect_time = str(int(time.time() * 1000))
+        detect_auth = self.get_authorization(self.lang_detect_url, self.auth_key, self.device_id, detect_time)
+        detect_add_headers = {'device-type': 'pc', 'timestamp': detect_time, 'authorization': detect_auth}
+        detect_headers = {**self.api_headers, **detect_add_headers}
+
+        if from_language == 'auto':
+            detect_form = urllib.parse.urlencode({'query': query_text})
+            async with self.session.post(lang_detect_url, headers=detect_headers, data=detect_form, timeout=timeout, proxy=proxies) as resp:
+                r_detect = await resp.read()            
+                from_language = json.loads(r_detect.decode())['langCode']
+
+        trans_time = str(int(time.time() * 1000))
+        trans_auth = self.get_authorization(self.api_url, self.auth_key, self.device_id, trans_time)
+        trans_update_headers = {'x-apigw-partnerid': 'papago', 'timestamp': trans_time, 'authorization': trans_auth}
+        detect_headers.update(trans_update_headers)
+        trans_headers = detect_headers
+
+        form_data = {
+            'deviceId': self.device_id,
+            'text': query_text, 'source': from_language, 'target': to_language, 'locale': 'en',
+            'dict': 'true', 'dictDisplay': 30, 'honorific': 'false', 'instant': 'false', 'paging': 'false',
+        }
+        form_data = urllib.parse.urlencode(form_data)
+        async with self.session.post(self.api_url, headers=trans_headers, data=form_data, timeout=timeout, proxy=proxies) as resp:
+            res = await resp.read()
+            data = json.loads(res.decode())
+            self.query_count += 1
+            return data if is_detail_result else data['translatedText']
+
 
 class TranslatorsServer:
     def __init__(self):
@@ -3230,6 +3361,9 @@ class TranslatorsServer:
         self._async_google = AsyncGoogleV2(server_region=self.server_region)
         self.async_google_coro = self._async_google.google_api
         self.async_google = self._async_google.async_google
+        self._async_papago = AsyncPapago()
+        self.async_papago_coro = self._async_papago.papago_api
+        self.async_papago = self._async_papago.async_papago
         self.translators_dict = {
             'alibaba': self.alibaba, 'argos': self.argos, 'baidu': self.baidu, 'bing':self.bing,
             'caiyun': self.caiyun, 'deepl': self.deepl, 'google': self.google, 'iciba': self.iciba,
@@ -3239,9 +3373,11 @@ class TranslatorsServer:
             'yandex': self.yandex, 'youdao': self.youdao,
         }
         self.translators_dict_async = {
-            'async_google':self.async_google_coro
+            'async_google':self.async_google_coro,
+            'async_papago': self.async_papago_coro
         }
-        self.translators_pool = list(self.translators_dict.keys()) + list(self.translators_dict_async.keys())
+        self.translators_pool = list(self.translators_dict.keys())
+        self.translators_async_pool = list(self.translators_dict_async.keys())
 
     async def coro_translate(self, translator, query_text, from_language, to_language, **kwargs):
         res = await self.translators_dict_async['async_%s'%translator](query_text, from_language, to_language, **kwargs)
@@ -3276,16 +3412,13 @@ class TranslatorsServer:
                 :param lingvanex_model: str, default 'B2C'.
         :return: str or dict
         """
-        print('translating')
-        if translator not in self.translators_pool:
+        if translator not in (self.translators_pool+self.translators_async_pool):
             raise TranslatorError
 
         if kwargs.get('is_async') and type(kwargs.get('is_async')) == bool:
             if self.translators_dict_async.get('async_%s'%translator):
-                print('async')
                 event_loop = asyncio.get_event_loop()
                 res = event_loop.run_until_complete(self.coro_translate(translator,query_text,from_language,to_language, **kwargs))
-                print(res)
                 return res
             
         return self.translators_dict[translator](query_text=query_text, from_language=from_language, to_language=to_language, **kwargs)
@@ -3323,7 +3456,7 @@ class TranslatorsServer:
         :return: str
         """
 
-        if translator not in self.translators_pool or kwargs.get('is_detail_result', False):
+        if translator not in (self.translators_pool+self.translators_async_pool) or kwargs.get('is_detail_result', False):
             raise TranslatorError
 
         if not kwargs.get('sleep_seconds', None):
@@ -3390,6 +3523,8 @@ _youdao = tss._youdao
 youdao = tss.youdao
 _async_google = tss._async_google
 async_google = tss.async_google
+_async_papago = tss._async_papago
+async_papago = tss.async_papago
 
 
 translate_text = tss.translate_text
